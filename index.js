@@ -73,16 +73,19 @@ function makeCIEDE2000Comparator(tolerance) {
     };
 }
 
-const iterateRect = (width, height, callback, endCallback) => {
+const iterateRect = (width, height, callback, rowDoneCallback, endCallback) => {
     const processRow = (y) => {
         setImmediate(() => {
             for (let x = 0; x < width; x++) {
                 callback(x, y);
             }
 
+            var isLastRow = y >= height;
+            rowDoneCallback(y, isLastRow);
+
             y++;
 
-            if (y < height) {
+            if (!isLastRow) {
                 processRow(y);
             } else {
                 endCallback();
@@ -101,7 +104,14 @@ const buildDiffImage = (png1, png2, options, callback) => {
     const highlightColor = options.highlightColor;
     const result = png.empty(width, height);
 
-    iterateRect(width, height, (x, y) => {
+    var differences = 0;
+    var pixelIgnored = false;
+
+    var prevPrevRow = [];
+    var prevRow = [];
+    var currentRow = [];
+
+    iterateRect(width, height, /*callback=*/(x, y) => {
         if (x >= minWidth || y >= minHeight) {
             result.setPixel(x, y, highlightColor);
             return;
@@ -111,11 +121,52 @@ const buildDiffImage = (png1, png2, options, callback) => {
         const color2 = png2.getPixel(x, y);
 
         if (!options.comparator({color1, color2})) {
-            result.setPixel(x, y, highlightColor);
+            if (typeof options.ignoreDifferentPixels === 'function' &&
+                options.ignoreDifferentPixels(x, y)) {
+                pixelIgnored = true;
+                result.setPixel(x, y, color1, /*alpha=*/100);
+            } else {
+                // Mark that the current row was different at position `x`.
+                currentRow[x] = true;
+
+                result.setPixel(x, y, highlightColor);
+                ++differences;
+            }
         } else {
-            result.setPixel(x, y, color1);
+            result.setPixel(x, y, color1, /*alpha=*/100);
         }
-    }, () => callback(result));
+    },
+    /*rowDoneCallback=*/(y, isLastRow) => {
+        // Check each difference in `prevRow`.
+        function checkRow(y) {
+            for (var x = 0; x < prevRow.length; ++x) {
+                if (prevRow[x] === true) {
+                    var hasNeighboorDiff =
+                        prevPrevRow[x-1] === true || prevPrevRow[x] === true ||
+                            prevPrevRow[x+1] === true ||
+                        prevRow[x-1] === true || prevRow[x+1] === true ||
+                        currentRow[x-1] === true || currentRow[x] === true ||
+                            currentRow[x+1] === true;
+                    if (!hasNeighboorDiff) {
+                        // Ignore this difference, since it is only a single pixel.
+                        result.setPixel(x, y, png1.getPixel(x, y), /*alpha=*/100);
+                        --differences;
+                    }
+                }
+            }
+        }
+
+        checkRow(y-1);
+
+        prevPrevRow = prevRow;
+        prevRow = currentRow;
+        currentRow = [];
+
+        if (isLastRow) {
+            checkRow(y);
+        }
+    },
+    /*endCallback=*/() => callback(result, differences === 0, pixelIgnored));
 };
 
 const parseColorString = (str) => {
@@ -213,24 +264,69 @@ exports.getDiffArea = function(reference, image, opts, callback) {
     });
 };
 
-exports.createDiff = function saveDiff(opts, callback) {
+exports.createDiff = function saveDiff(opts) {
     const tolerance = getToleranceFromOpts(opts);
 
-    readPair(opts.reference, opts.current, (error, result) => {
-        if (error) {
-            return callback(error);
-        }
+    return new Promise((resolve, reject) => {
+        readPair(opts.reference, opts.current, (error, pair) => {
+            if (error) {
+                reject(error);
+                return;
+            }
 
-        const diffOptions = {
-            highlightColor: parseColorString(opts.highlightColor),
-            comparator: opts.strict ? areColorsSame : makeCIEDE2000Comparator(tolerance)
-        };
+            var diffOptions = {
+                highlightColor: parseColorString(opts.highlightColor),
+                comparator: opts.strict ? areColorsSame : makeCIEDE2000Comparator(tolerance),
+                ignoreDifferentPixels: null
+            };
 
-        buildDiffImage(result.first, result.second, diffOptions, (result) => {
-            if (opts.diff === undefined) {
-                result.createBuffer(callback);
+            function start() {
+                buildDiffImage(pair.first, pair.second, diffOptions, (pair, equal, pixelIgnored) => {
+                    if (equal) {
+                        resolve({ equal: true, pixelIgnored: pixelIgnored });
+                    } else {
+                        pair.save(opts.diff, function callback(error) {
+                            if (error) {
+                                reject(error);
+                            } else {
+                                resolve({ equal: false });
+                            }
+                        });
+                    }
+                });
+            }
+
+            if (opts.ignoreDifferentPixels) {
+                readPair(opts.ignoreDifferentPixels.reference, opts.ignoreDifferentPixels.current, (error, otherPair) => {
+                    if (error) {
+                        reject(error);
+                        return;
+                    }
+
+                    var png1 = otherPair.first;
+                    var png2 = otherPair.second;
+
+                    diffOptions.ignoreDifferentPixels = function (x, y) {
+                        const maxWidth = Math.max(png1.width, png2.width);
+                        const maxHeight = Math.max(png1.height, png2.height);
+                        const minWidth = Math.min(png1.width, png2.width);
+                        const minHeight = Math.min(png1.height, png2.height);
+
+                        if (x >= minWidth) {
+                            return x < maxWidth;
+                        } else if (y >= minHeight) {
+                            return y < maxHeight;
+                        }
+
+                        const color1 = png1.getPixel(x, y);
+                        const color2 = png2.getPixel(x, y);
+                        return !diffOptions.comparator({color1, color2});
+                    };
+
+                    start();
+                });
             } else {
-                result.save(opts.diff, callback);
+                start();
             }
         });
     });
